@@ -1,3 +1,4 @@
+
 package com.jinle.serialmonitor;
 
 import android.app.Activity;
@@ -76,6 +77,7 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
     private final TextView[] stateViews = new TextView[CHANNEL_COUNT];
     private final TextView[] mappingViews = new TextView[FACE_COUNT];
     private final long[] receiveCounts = new long[CHANNEL_COUNT];
+    private final boolean[] rawDataSeen = new boolean[CHANNEL_COUNT];
     private final AtomicLong recordSequence = new AtomicLong();
     private final AtomicBoolean connectionInProgress = new AtomicBoolean(false);
     private final Object recordLock = new Object();
@@ -423,103 +425,7 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
         LinearLayout rows = new LinearLayout(this);
         rows.setOrientation(LinearLayout.VERTICAL);
         rows.setPadding(dp(14), dp(8), dp(14), dp(8));
-        Spinner[] spinners = new Spinner[BOARD_COUNT];
-        for (int logical = 0; logical < BOARD_COUNT; logical++) {
-            LinearLayout row = new LinearLayout(this);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            TextView label = text(boardSlotName(logical), 16, Color.rgb(33, 54, 77), true);
-            spinners[logical] = new Spinner(this);
-            spinners[logical].setMinimumHeight(dp(48));
-            ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
-                    android.R.layout.simple_spinner_dropdown_item, options);
-            spinners[logical].setAdapter(adapter);
-            spinners[logical].setSelection(boardMapping[logical]);
-            row.addView(label, new LinearLayout.LayoutParams(0,
-                    LinearLayout.LayoutParams.WRAP_CONTENT, 0.42f));
-            row.addView(spinners[logical], new LinearLayout.LayoutParams(0,
-                    LinearLayout.LayoutParams.WRAP_CONTENT, 0.58f));
-            rows.addView(row);
-        }
-        ScrollView scroll = new ScrollView(this);
-        scroll.addView(rows);
-        AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle("记忆8块USB转接板顺序")
-                .setMessage("默认Hub插入顺序：前上、前下、左上、左下、后上、后下、右上、右下。每块设备只能选择一次；保存后APP会自动记忆。")
-                .setView(scroll)
-                .setNegativeButton("取消", null)
-                .setNeutralButton("恢复默认顺序", null)
-                .setPositiveButton("保存并重连", null)
-                .create();
-        dialog.setOnShowListener(ignored -> {
-            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> {
-                for (int i = 0; i < BOARD_COUNT; i++) spinners[i].setSelection(i);
-                Toast.makeText(this, "已恢复前上、前下、左上、左下、后上、后下、右上、右下",
-                        Toast.LENGTH_SHORT).show();
-            });
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
-                            int[] selected = new int[BOARD_COUNT];
-                            for (int i = 0; i < BOARD_COUNT; i++) selected[i] = spinners[i].getSelectedItemPosition();
-                            if (!validMapping(selected)) {
-                                Toast.makeText(this, "USB设备不能重复选择", Toast.LENGTH_LONG).show();
-                                return;
-                            }
-                            boardMapping = selected;
-                            saveBoardMapping();
-                            updateMappingLabels();
-                            dialog.dismiss();
-                            scanAndConnect();
-                        });
-        });
-        dialog.show();
-    }
-
-    private void loadBoardMapping() {
-        if (getPreferences(MODE_PRIVATE).getInt(PREF_MAPPING_SCHEMA, 0) != USB_MAPPING_SCHEMA) {
-            boardMapping = identityMapping();
-            return;
-        }
-        String saved = getPreferences(MODE_PRIVATE).getString(PREF_BOARD_MAPPING, "");
-        if (saved == null || saved.isEmpty()) return;
-        String[] parts = saved.split(",");
-        if (parts.length != BOARD_COUNT) return;
-        int[] parsed = new int[BOARD_COUNT];
-        try {
-            for (int i = 0; i < BOARD_COUNT; i++) parsed[i] = Integer.parseInt(parts[i]);
-            if (validMapping(parsed)) boardMapping = parsed;
-        } catch (NumberFormatException ignored) {
-        }
-        hasRememberedUsbOrder = true;
-        for (int i = 0; i < BOARD_COUNT; i++) {
-            rememberedDeviceKeys[i] = getPreferences(MODE_PRIVATE)
-                    .getString(PREF_BOARD_KEY_PREFIX + i, "");
-            if (rememberedDeviceKeys[i] == null || rememberedDeviceKeys[i].isEmpty()) {
-                hasRememberedUsbOrder = false;
-            }
-        }
-    }
-
-    private void saveBoardMapping() {
-        StringBuilder value = new StringBuilder();
-        for (int i = 0; i < BOARD_COUNT; i++) {
-            if (i > 0) value.append(',');
-            value.append(boardMapping[i]);
-        }
-        android.content.SharedPreferences.Editor editor = getPreferences(MODE_PRIVATE).edit()
-                .putInt(PREF_MAPPING_SCHEMA, USB_MAPPING_SCHEMA)
-                .putString(PREF_BOARD_MAPPING, value.toString());
-        for (int i = 0; i < BOARD_COUNT; i++) {
-            editor.remove(PREF_BOARD_KEY_PREFIX + i);
-            rememberedDeviceKeys[i] = "";
-        }
-        hasRememberedUsbOrder = false;
-        editor.apply();
-    }
-
-    /** Saves logical positions by unique USB serial number when available, otherwise by device path. */
-    private void rememberLogicalDeviceOrder(List<UsbDevice> logicalDevices) {
-        if (logicalDevices.size() != BOARD_COUNT) return;
-        String[] keys = uniqueDeviceKeys(logicalDevices);
+        Spinner[] spin…1238 tokens truncated…icalDevices);
         StringBuilder mappingValue = new StringBuilder();
         for (int i = 0; i < BOARD_COUNT; i++) {
             if (i > 0) mappingValue.append(',');
@@ -618,13 +524,29 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
     }
 
     @Override
+    public void onData(Ch348Device source, int port, int byteCount) {
+        int index = channelIndex(source, port);
+        if (index < 0) return;
+        synchronized (rawDataSeen) {
+            if (rawDataSeen[index]) return;
+            rawDataSeen[index] = true;
+        }
+        mainHandler.post(() -> {
+            if (receiveCounts[index] == 0) {
+                stateViews[index].setText("已收到串口数据，正在解析");
+                stateViews[index].setTextColor(Color.rgb(196, 119, 31));
+            }
+        });
+    }
+
+    @Override
     public void onLine(Ch348Device source, int port, String raw, Double distanceMm) {
         int logicalBoard = source.getLogicalGroup();
         int face = logicalBoard / 2;
         boolean upperBoard = (logicalBoard & 1) == 0;
         int layer = (upperBoard ? 0 : PORTS_PER_BOARD) + port;
-        int index = face * LAYERS_PER_FACE + layer;
-        if (index < 0 || index >= CHANNEL_COUNT) return;
+        int index = channelIndex(source, port);
+        if (index < 0) return;
         long count = ++receiveCounts[index];
         if (measuring && distanceMm != null) measurementSession.addSample(face, layer, distanceMm);
         if (recording && measuring) writeRecord(face, layer, source.getLogicalGroup(), port, raw, distanceMm);
@@ -636,11 +558,23 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
                         : String.format(Locale.CHINA, "%.1f mm", distanceMm);
                 distanceViews[index].setText(value);
                 distanceViews[index].setTextColor(Color.rgb(7, 120, 95));
-                stateViews[index].setText(String.format(Locale.CHINA, "%,d条", count));
+                stateViews[index].setText(String.format(Locale.CHINA, "实时 · %,d条", count));
+                stateViews[index].setTextColor(Color.rgb(7, 120, 95));
             } else {
-                stateViews[index].setText(raw.length() > 14 ? raw.substring(0, 14) + "…" : raw);
+                String preview = raw.length() > 18 ? raw.substring(0, 18) + "…" : raw;
+                stateViews[index].setText("未识别: " + preview);
+                stateViews[index].setTextColor(Color.rgb(190, 72, 64));
             }
         });
+    }
+
+    private static int channelIndex(Ch348Device source, int port) {
+        int logicalBoard = source.getLogicalGroup();
+        if (logicalBoard < 0 || logicalBoard >= BOARD_COUNT ||
+                port < 0 || port >= PORTS_PER_BOARD) return -1;
+        int face = logicalBoard / 2;
+        int layer = ((logicalBoard & 1) == 0 ? 0 : PORTS_PER_BOARD) + port;
+        return face * LAYERS_PER_FACE + layer;
     }
 
     @Override
