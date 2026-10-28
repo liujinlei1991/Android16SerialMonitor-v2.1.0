@@ -1,4 +1,3 @@
-
 package com.jinle.serialmonitor;
 
 import android.app.Activity;
@@ -425,7 +424,103 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
         LinearLayout rows = new LinearLayout(this);
         rows.setOrientation(LinearLayout.VERTICAL);
         rows.setPadding(dp(14), dp(8), dp(14), dp(8));
-        Spinner[] spin…1238 tokens truncated…icalDevices);
+        Spinner[] spinners = new Spinner[BOARD_COUNT];
+        for (int logical = 0; logical < BOARD_COUNT; logical++) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            TextView label = text(boardSlotName(logical), 16, Color.rgb(33, 54, 77), true);
+            spinners[logical] = new Spinner(this);
+            spinners[logical].setMinimumHeight(dp(48));
+            ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
+                    android.R.layout.simple_spinner_dropdown_item, options);
+            spinners[logical].setAdapter(adapter);
+            spinners[logical].setSelection(boardMapping[logical]);
+            row.addView(label, new LinearLayout.LayoutParams(0,
+                    LinearLayout.LayoutParams.WRAP_CONTENT, 0.42f));
+            row.addView(spinners[logical], new LinearLayout.LayoutParams(0,
+                    LinearLayout.LayoutParams.WRAP_CONTENT, 0.58f));
+            rows.addView(row);
+        }
+        ScrollView scroll = new ScrollView(this);
+        scroll.addView(rows);
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("记忆8块USB转接板顺序")
+                .setMessage("默认Hub插入顺序：前上、前下、左上、左下、后上、后下、右上、右下。每块设备只能选择一次；保存后APP会自动记忆。")
+                .setView(scroll)
+                .setNegativeButton("取消", null)
+                .setNeutralButton("恢复默认顺序", null)
+                .setPositiveButton("保存并重连", null)
+                .create();
+        dialog.setOnShowListener(ignored -> {
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> {
+                for (int i = 0; i < BOARD_COUNT; i++) spinners[i].setSelection(i);
+                Toast.makeText(this, "已恢复前上、前下、左上、左下、后上、后下、右上、右下",
+                        Toast.LENGTH_SHORT).show();
+            });
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+                            int[] selected = new int[BOARD_COUNT];
+                            for (int i = 0; i < BOARD_COUNT; i++) selected[i] = spinners[i].getSelectedItemPosition();
+                            if (!validMapping(selected)) {
+                                Toast.makeText(this, "USB设备不能重复选择", Toast.LENGTH_LONG).show();
+                                return;
+                            }
+                            boardMapping = selected;
+                            saveBoardMapping();
+                            updateMappingLabels();
+                            dialog.dismiss();
+                            scanAndConnect();
+                        });
+        });
+        dialog.show();
+    }
+
+    private void loadBoardMapping() {
+        if (getPreferences(MODE_PRIVATE).getInt(PREF_MAPPING_SCHEMA, 0) != USB_MAPPING_SCHEMA) {
+            boardMapping = identityMapping();
+            return;
+        }
+        String saved = getPreferences(MODE_PRIVATE).getString(PREF_BOARD_MAPPING, "");
+        if (saved == null || saved.isEmpty()) return;
+        String[] parts = saved.split(",");
+        if (parts.length != BOARD_COUNT) return;
+        int[] parsed = new int[BOARD_COUNT];
+        try {
+            for (int i = 0; i < BOARD_COUNT; i++) parsed[i] = Integer.parseInt(parts[i]);
+            if (validMapping(parsed)) boardMapping = parsed;
+        } catch (NumberFormatException ignored) {
+        }
+        hasRememberedUsbOrder = true;
+        for (int i = 0; i < BOARD_COUNT; i++) {
+            rememberedDeviceKeys[i] = getPreferences(MODE_PRIVATE)
+                    .getString(PREF_BOARD_KEY_PREFIX + i, "");
+            if (rememberedDeviceKeys[i] == null || rememberedDeviceKeys[i].isEmpty()) {
+                hasRememberedUsbOrder = false;
+            }
+        }
+    }
+
+    private void saveBoardMapping() {
+        StringBuilder value = new StringBuilder();
+        for (int i = 0; i < BOARD_COUNT; i++) {
+            if (i > 0) value.append(',');
+            value.append(boardMapping[i]);
+        }
+        android.content.SharedPreferences.Editor editor = getPreferences(MODE_PRIVATE).edit()
+                .putInt(PREF_MAPPING_SCHEMA, USB_MAPPING_SCHEMA)
+                .putString(PREF_BOARD_MAPPING, value.toString());
+        for (int i = 0; i < BOARD_COUNT; i++) {
+            editor.remove(PREF_BOARD_KEY_PREFIX + i);
+            rememberedDeviceKeys[i] = "";
+        }
+        hasRememberedUsbOrder = false;
+        editor.apply();
+    }
+
+    /** Saves logical positions by unique USB serial number when available, otherwise by device path. */
+    private void rememberLogicalDeviceOrder(List<UsbDevice> logicalDevices) {
+        if (logicalDevices.size() != BOARD_COUNT) return;
+        String[] keys = uniqueDeviceKeys(logicalDevices);
         StringBuilder mappingValue = new StringBuilder();
         for (int i = 0; i < BOARD_COUNT; i++) {
             if (i > 0) mappingValue.append(',');
