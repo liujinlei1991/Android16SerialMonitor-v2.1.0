@@ -1,3 +1,4 @@
+
 package com.jinle.serialmonitor;
 
 import android.hardware.usb.UsbConstants;
@@ -27,6 +28,7 @@ final class Ch348Device implements Closeable {
     static final int PORT_COUNT = 8;
 
     interface Listener {
+        void onData(Ch348Device source, int port, int byteCount);
         void onLine(Ch348Device source, int port, String raw, Double distanceMm);
         void onError(Ch348Device source, String message, Throwable error);
     }
@@ -297,7 +299,10 @@ final class Ch348Device implements Closeable {
                     offset++;
                     continue;
                 }
-                if (dataLength > 0) distanceParser.accept(port, all, offset + 2, dataLength);
+                if (dataLength > 0) {
+                    listener.onData(Ch348Device.this, port, dataLength);
+                    distanceParser.accept(port, all, offset + 2, dataLength);
+                }
                 offset += 32;
             }
             pending.reset();
