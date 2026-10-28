@@ -58,6 +58,8 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
     private static final int PORTS_PER_BOARD = 8;
     private static final int CHANNEL_COUNT = FACE_COUNT * LAYERS_PER_FACE;
     private static final long MEASUREMENT_DURATION_MS = 10_000L;
+    private static final long LIVE_UI_REFRESH_MS = 200L;
+    private static final long COUNT_UI_REFRESH_MS = 1_000L;
     private static final int USB_MAPPING_SCHEMA = 2;
     private static final String PREF_BOARD_MAPPING = "boardMappingV2";
     private static final String PREF_BOARD_KEY_PREFIX = "boardDeviceKeyV2_";
@@ -77,9 +79,22 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
     private final TextView[] mappingViews = new TextView[FACE_COUNT];
     private final long[] receiveCounts = new long[CHANNEL_COUNT];
     private final boolean[] rawDataSeen = new boolean[CHANNEL_COUNT];
+    private final double[] pendingDistances = new double[CHANNEL_COUNT];
+    private final String[] pendingRaw = new String[CHANNEL_COUNT];
+    private final boolean[] pendingHasDistance = new boolean[CHANNEL_COUNT];
+    private final boolean[] pendingLiveDirty = new boolean[CHANNEL_COUNT];
+    private final double[] renderDistances = new double[CHANNEL_COUNT];
+    private final long[] renderCounts = new long[CHANNEL_COUNT];
+    private final String[] renderRaw = new String[CHANNEL_COUNT];
+    private final boolean[] renderHasDistance = new boolean[CHANNEL_COUNT];
+    private final boolean[] renderLiveDirty = new boolean[CHANNEL_COUNT];
     private final AtomicLong recordSequence = new AtomicLong();
+    private final AtomicLong measurementSampleCounter = new AtomicLong();
     private final AtomicBoolean connectionInProgress = new AtomicBoolean(false);
     private final Object recordLock = new Object();
+    private final Object liveDataLock = new Object();
+    private final SimpleDateFormat recordTimestampFormat =
+            new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US);
 
     private UsbManager usbManager;
     private PendingIntent permissionIntent;
@@ -108,6 +123,63 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
     private long recordCount;
     private boolean permissionRequestInFlight;
     private boolean destroyed;
+    private long lastCountUiUpdate;
+
+    private final Runnable liveUiTicker = new Runnable() {
+        @Override
+        public void run() {
+            if (destroyed) return;
+            if (liveView != null && liveView.getVisibility() == View.VISIBLE) {
+                synchronized (liveDataLock) {
+                    for (int i = 0; i < CHANNEL_COUNT; i++) {
+                        if (!pendingLiveDirty[i]) continue;
+                        renderDistances[i] = pendingDistances[i];
+                        renderCounts[i] = receiveCounts[i];
+                        renderRaw[i] = pendingRaw[i];
+                        renderHasDistance[i] = pendingHasDistance[i];
+                        renderLiveDirty[i] = true;
+                        pendingLiveDirty[i] = false;
+                    }
+                }
+
+                long now = SystemClock.elapsedRealtime();
+                boolean updateCounts = now - lastCountUiUpdate >= COUNT_UI_REFRESH_MS;
+                for (int i = 0; i < CHANNEL_COUNT; i++) {
+                    if (!renderLiveDirty[i]) continue;
+                    renderLiveDirty[i] = false;
+                    if (renderHasDistance[i]) {
+                        double distanceMm = renderDistances[i];
+                        String value = Math.rint(distanceMm) == distanceMm
+                                ? String.format(Locale.CHINA, "%.0f mm", distanceMm)
+                                : String.format(Locale.CHINA, "%.1f mm", distanceMm);
+                        if (!value.contentEquals(distanceViews[i].getText())) {
+                            distanceViews[i].setText(value);
+                        }
+                        if (distanceViews[i].getCurrentTextColor() != Color.rgb(7, 120, 95)) {
+                            distanceViews[i].setTextColor(Color.rgb(7, 120, 95));
+                        }
+                        if (updateCounts) {
+                            stateViews[i].setText(String.format(Locale.CHINA,
+                                    "实时 · %,d条", renderCounts[i]));
+                            stateViews[i].setTextColor(Color.rgb(7, 120, 95));
+                        }
+                    } else {
+                        String raw = renderRaw[i] == null ? "" : renderRaw[i];
+                        String preview = raw.length() > 18 ? raw.substring(0, 18) + "…" : raw;
+                        String message = "未识别: " + preview;
+                        if (!message.contentEquals(stateViews[i].getText())) {
+                            stateViews[i].setText(message);
+                        }
+                        if (stateViews[i].getCurrentTextColor() != Color.rgb(190, 72, 64)) {
+                            stateViews[i].setTextColor(Color.rgb(190, 72, 64));
+                        }
+                    }
+                }
+                if (updateCounts) lastCountUiUpdate = now;
+            }
+            mainHandler.postDelayed(this, LIVE_UI_REFRESH_MS);
+        }
+    };
 
     private final Runnable measurementTicker = new Runnable() {
         @Override
@@ -119,13 +191,10 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
                 return;
             }
             double seconds = remaining / 1000.0;
-            int total = 0;
-            for (int face = 0; face < FACE_COUNT; face++) {
-                total += measurementSession.getFaceSampleCount(face);
-            }
+            long total = measurementSampleCounter.get();
             measureButton.setText(String.format(Locale.CHINA, "四面测量中 · %.1f秒", seconds));
             recordStatus.setText(String.format(Locale.CHINA, "64路同步采集中 · %.1f秒 · %,d条", seconds, total));
-            mainHandler.postDelayed(this, 100);
+            mainHandler.postDelayed(this, 250);
         }
     };
 
@@ -158,6 +227,7 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
         permissionIntent = PendingIntent.getBroadcast(this, 0,
                 new Intent(ACTION_USB_PERMISSION).setPackage(getPackageName()), flags);
         buildUi();
+        mainHandler.post(liveUiTicker);
         registerUsbReceiver();
         scanAndConnect();
     }
@@ -627,7 +697,11 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
             rawDataSeen[index] = true;
         }
         mainHandler.post(() -> {
-            if (receiveCounts[index] == 0) {
+            long count;
+            synchronized (liveDataLock) {
+                count = receiveCounts[index];
+            }
+            if (count == 0) {
                 stateViews[index].setText("已收到串口数据，正在解析");
                 stateViews[index].setTextColor(Color.rgb(196, 119, 31));
             }
@@ -642,25 +716,18 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
         int layer = (upperBoard ? 0 : PORTS_PER_BOARD) + port;
         int index = channelIndex(source, port);
         if (index < 0) return;
-        long count = ++receiveCounts[index];
-        if (measuring && distanceMm != null) measurementSession.addSample(face, layer, distanceMm);
+        synchronized (liveDataLock) {
+            receiveCounts[index]++;
+            pendingHasDistance[index] = distanceMm != null;
+            if (distanceMm != null) pendingDistances[index] = distanceMm;
+            pendingRaw[index] = raw;
+            pendingLiveDirty[index] = true;
+        }
+        if (measuring && distanceMm != null) {
+            measurementSession.addSample(face, layer, distanceMm);
+            measurementSampleCounter.incrementAndGet();
+        }
         if (recording && measuring) writeRecord(face, layer, source.getLogicalGroup(), port, raw, distanceMm);
-
-        mainHandler.post(() -> {
-            if (distanceMm != null) {
-                String value = Math.rint(distanceMm) == distanceMm
-                        ? String.format(Locale.CHINA, "%.0f mm", distanceMm)
-                        : String.format(Locale.CHINA, "%.1f mm", distanceMm);
-                distanceViews[index].setText(value);
-                distanceViews[index].setTextColor(Color.rgb(7, 120, 95));
-                stateViews[index].setText(String.format(Locale.CHINA, "实时 · %,d条", count));
-                stateViews[index].setTextColor(Color.rgb(7, 120, 95));
-            } else {
-                String preview = raw.length() > 18 ? raw.substring(0, 18) + "…" : raw;
-                stateViews[index].setText("未识别: " + preview);
-                stateViews[index].setTextColor(Color.rgb(190, 72, 64));
-            }
-        });
     }
 
     private static int channelIndex(Ch348Device source, int port) {
@@ -688,6 +755,7 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
             return;
         }
         measurementSession = new MeasurementSession();
+        measurementSampleCounter.set(0);
         if (!startRecording()) return;
         liveView.setVisibility(View.VISIBLE);
         resultPanel.setVisibility(View.GONE);
@@ -804,7 +872,7 @@ public final class MainActivity extends Activity implements Ch348Device.Listener
             if (!recording || recordWriter == null) return;
             try {
                 long sequence = recordSequence.incrementAndGet();
-                String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(new Date());
+                String timestamp = recordTimestampFormat.format(new Date());
                 String row = csv(timestamp) + ',' + sequence + ',' +
                         csv(MeasurementSession.FACE_NAMES[face]) + ',' + (layer + 1) + ',' +
                         csv("板" + (board + 1)) + ',' + csv(String.valueOf(CHANNEL_NAMES[port])) + ',' +
