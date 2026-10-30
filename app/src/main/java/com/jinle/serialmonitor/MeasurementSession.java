@@ -14,6 +14,13 @@ final class MeasurementSession {
     static final int FACE_RIGHT = 3;
     static final int FACE_COUNT = 4;
     static final int LAYER_COUNT = 16;
+    static final String ALGORITHM_VERSION = "2.1.4-experimental";
+    static final int MIN_SAMPLES = 20;
+    // Constant residual correction, fitted on four subjects (two repeats each).
+    // This is NOT a measured radar offset and does not alter the raw contour.
+    static final double WAIST_CORRECTION_CM = 8.959187807243989;
+    static final double HIP_CORRECTION_CM = 13.001079962193373;
+    private final boolean calibrated;
     static final double SENSOR_CENTER_DISTANCE_MM = 500.0;
     static final double LOWEST_SENSOR_HEIGHT_MM = 635.0;
     static final double SENSOR_SPACING_MM = 40.0;
@@ -26,6 +33,11 @@ final class MeasurementSession {
     private final List<Double>[][] samples = new ArrayList[FACE_COUNT][LAYER_COUNT];
 
     MeasurementSession() {
+        this(true);
+    }
+
+    MeasurementSession(boolean calibrated) {
+        this.calibrated = calibrated;
         for (int phase = 0; phase < FACE_COUNT; phase++) {
             for (int layer = 0; layer < LAYER_COUNT; layer++) {
                 samples[phase][layer] = new ArrayList<>();
@@ -36,7 +48,7 @@ final class MeasurementSession {
     synchronized void addSample(int phase, int layer, double distanceMm) {
         if (phase < 0 || phase >= FACE_COUNT || layer < 0 || layer >= LAYER_COUNT) return;
         // Broad physical gate. Temporal median and cross-height smoothing reject remaining spikes.
-        if (!Double.isFinite(distanceMm) || distanceMm < 100.0 || distanceMm > 600.0) return;
+        if (!Double.isFinite(distanceMm) || distanceMm <= 180.0 || distanceMm > 600.0) return;
         samples[phase][layer].add(distanceMm);
     }
 
@@ -53,7 +65,7 @@ final class MeasurementSession {
     synchronized int getFaceValidLayerCount(int phase) {
         int count = 0;
         for (int layer = 0; layer < LAYER_COUNT; layer++) {
-            if (samples[phase][layer].size() >= 3) count++;
+            if (samples[phase][layer].size() >= MIN_SAMPLES) count++;
         }
         return count;
     }
@@ -69,7 +81,7 @@ final class MeasurementSession {
         for (int phase = 0; phase < FACE_COUNT; phase++) {
             for (int layer = 0; layer < LAYER_COUNT; layer++) {
                 counts[phase][layer] = samples[phase][layer].size();
-                distances[phase][layer] = samples[phase][layer].size() >= 3
+                distances[phase][layer] = samples[phase][layer].size() >= MIN_SAMPLES
                         ? median(samples[phase][layer]) : Double.NaN;
             }
         }
@@ -117,13 +129,10 @@ final class MeasurementSession {
         }
 
         // Adult anatomical search bands for top-to-bottom layers in the 1235..635 mm installation.
-        int waist = findMinimum(smoothCircumference, 3, 10); // 1115..835 mm
-        int hipStart = waist >= 0 ? Math.max(5, waist + 1) : 5;
-        int hip = findMaximum(smoothCircumference, hipStart, 14); // below the waist
-        if (waist < 0) waist = findMinimum(smoothCircumference, 0, LAYER_COUNT - 1);
-        if (hip < 0 && waist >= 0 && waist < LAYER_COUNT - 1) {
-            hip = findMaximum(smoothCircumference, waist + 1, LAYER_COUNT - 1);
-        }
+        // Locate the lower-body peak first: a thigh trough must not become the waist
+        // and then exclude the true hip. Require at least 80 mm between the sites.
+        int hip = findMaximum(smoothCircumference, 5, 14);
+        int waist = hip >= 0 ? findMinimum(smoothCircumference, 3, Math.min(10, hip - 2)) : -1;
 
         String warning = null;
         if (validLayers < 10 || waist < 0 || hip < 0) {
@@ -132,8 +141,23 @@ final class MeasurementSession {
             warning = "臀围未明显大于腰围，请检查站位或衣物";
         }
 
+        int unstable = 0;
+        for (int face = 0; face < FACE_COUNT; face++) {
+            for (int layer = 0; layer < LAYER_COUNT; layer++) {
+                if (counts[face][layer] < MIN_SAMPLES) continue;
+                List<Double> deviations = new ArrayList<>();
+                for (double value : samples[face][layer])
+                    deviations.add(Math.abs(value - distances[face][layer]));
+                if (median(deviations) > 15.0) unstable++;
+            }
+        }
+        if (unstable > 0) warning = (warning == null ? "" : warning + "；") +
+                unstable + "路波动较大，请复测";
+        if (waist == 3 || hip == 14) warning = (warning == null ? "" : warning + "；") +
+                "选层靠近搜索边界，请核对软尺高度";
+
         return new Result(height, smoothWidth, smoothDepth, smoothCircumference,
-                distances, counts, validLayers, waist, hip, warning);
+                distances, counts, validLayers, waist, hip, warning, calibrated);
     }
 
     private static boolean validRadius(double radius) {
@@ -152,6 +176,8 @@ final class MeasurementSession {
         double[] result = new double[source.length];
         Arrays.fill(result, Double.NaN);
         for (int i = 0; i < source.length; i++) {
+            // Do not manufacture a valid measurement at a missing/bad layer.
+            if (!Double.isFinite(source[i])) continue;
             List<Double> neighborhood = new ArrayList<>(3);
             for (int j = Math.max(0, i - 1); j <= Math.min(source.length - 1, i + 1); j++) {
                 if (Double.isFinite(source[j])) neighborhood.add(source[j]);
@@ -195,11 +221,13 @@ final class MeasurementSession {
         final int waistLayer;
         final int hipLayer;
         final String warning;
+        final boolean calibrated;
 
         Result(double[] heightsMm, double[] widthsMm, double[] depthsMm,
                double[] circumferencesMm, double[][] medianDistancesMm,
                int[][] sampleCounts, int validLayers, int waistLayer, int hipLayer,
-               String warning) {
+               String warning, boolean calibrated) {
+            this.calibrated = calibrated;
             this.heightsMm = heightsMm;
             this.widthsMm = widthsMm;
             this.depthsMm = depthsMm;
@@ -213,16 +241,24 @@ final class MeasurementSession {
         }
 
         boolean hasMeasurement() {
-            return waistLayer >= 0 && hipLayer >= 0 &&
+            return validLayers >= 10 && waistLayer >= 0 && hipLayer >= 0 &&
                     Double.isFinite(circumferencesMm[waistLayer]) &&
                     Double.isFinite(circumferencesMm[hipLayer]);
         }
 
         double waistCm() {
-            return hasMeasurement() ? circumferencesMm[waistLayer] / 10.0 : Double.NaN;
+            return rawWaistCm() + (calibrated ? WAIST_CORRECTION_CM : 0.0);
         }
 
         double hipCm() {
+            return rawHipCm() + (calibrated ? HIP_CORRECTION_CM : 0.0);
+        }
+
+        double rawWaistCm() {
+            return hasMeasurement() ? circumferencesMm[waistLayer] / 10.0 : Double.NaN;
+        }
+
+        double rawHipCm() {
             return hasMeasurement() ? circumferencesMm[hipLayer] / 10.0 : Double.NaN;
         }
 
